@@ -116,7 +116,7 @@ VOICE_ROUTING = {
 
 def _make_llm(temperature: float = 0.3) -> ChatGroq:
     key = _require_key()
-    return ChatGroq(model="llama-3.3-70b-versatile", temperature=temperature, api_key=key)
+    return ChatGroq(model="openai/gpt-oss-120b", temperature=temperature, api_key=key)
 
 
 def _groq_client() -> Groq:
@@ -128,32 +128,63 @@ def _groq_client() -> Groq:
 # Graph Nodes
 # ----------------------------------------------------------------------
 def detect_intent_and_language(state: AgentState) -> Dict[str, Any]:
-    llm = _make_llm(temperature=0.3).with_structured_output(IntentAndLanguage)
+    llm = _make_llm(temperature=0)
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are the Intent and Language recognition module of VoiceBridge.
-        Analyze the input and classify into:
-        - MODE A: Translation/Statements (no clear question markers).
-        - MODE B: Audio handling (Triggered if context hints audio source).
-        - MODE C: Q&A (Contains explicit or implicit questions, ?, what, how, why, etc.).
-        - MODE D: Contextual question about uploaded document/audio.
+        (
+            "system",
+            """You are the Intent and Language recognition module of VoiceBridge.
 
-        Identify the source language (en, ta, hi, te, kn, ml, bn, mr, gu, pa, or, ur).
-        Determine the logical target language (If input is english -> match chosen target or default regional; if input is regional -> english).
-        """),
-        ("human", "Input text: {input_text}\nContext available: {context_document}")
+Analyze the input and return ONLY valid JSON.
+
+Use exactly this format:
+
+{{
+    "mode": "A",
+    "source_lang": "en",
+    "target_lang": "ta"
+}}
+
+MODE:
+A = Translation / Statement
+B = Audio handling
+C = Question and Answer
+D = Contextual question about uploaded document/audio
+
+source_lang must be one of:
+en, ta, hi, te, kn, ml, bn, mr, gu, pa, or, ur
+
+target_lang must be one of:
+en, ta, hi, te, kn, ml, bn, mr, gu, pa, or, ur
+
+Do not return anything except JSON."""
+        ),
+        (
+            "human",
+            "Input text: {input_text}\nContext available: {context_document}"
+        )
     ])
 
-    chain = prompt | llm
-    res = chain.invoke({"input_text": state.input_text, "context_document": state.context_document})
+    res = (prompt | llm).invoke({
+        "input_text": state.input_text,
+        "context_document": state.context_document
+    })
 
-    target = state.target_lang_override if state.target_lang_override else res.target_lang
-    if target == res.source_lang and res.source_lang == "en":
-        target = "ta"  # Fallback variant mapping
+    import json
+    data = json.loads(res.content)
+
+    target = (
+        state.target_lang_override
+        if state.target_lang_override
+        else data["target_lang"]
+    )
+
+    if target == data["source_lang"] and data["source_lang"] == "en":
+        target = "ta"
 
     return {
-        "mode": res.mode,
-        "source_lang": res.source_lang,
+        "mode": data["mode"],
+        "source_lang": data["source_lang"],
         "target_lang": target,
     }
 
@@ -256,14 +287,29 @@ voicebridge_agent = build_voicebridge_graph()
 # above rather than replacing it.
 # ----------------------------------------------------------------------
 def _detect_source_lang(text: str) -> str:
-    llm = _make_llm(temperature=0).with_structured_output(DetectedLanguage)
+    llm = _make_llm(temperature=0)
+
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "Identify the dominant language of the given text. Return only a 2-letter ISO code "
-                   "(en, ta, hi, te, kn, ml, bn, mr, gu, pa, or, ur)."),
+        (
+            "system",
+            """Identify the dominant language of the given text.
+
+Return ONLY valid JSON in this exact format:
+
+{{"source_lang": "en"}}
+
+Allowed language codes:
+en, ta, hi, te, kn, ml, bn, mr, gu, pa, or, ur"""
+        ),
         ("human", "{text}")
     ])
+
     res = (prompt | llm).invoke({"text": text})
-    return res.source_lang
+
+    import json
+    data = json.loads(res.content)
+
+    return data["source_lang"]
 
 
 def translate_text(input_text: str, target_lang: Optional[str]) -> Dict[str, Any]:
